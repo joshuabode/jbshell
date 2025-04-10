@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"golang.org/x/term"
@@ -13,65 +14,85 @@ import (
 
 var builtins = []string{"type", "exit", "echo", "pwd", "cd"}
 
-func unquote(args []string) []string {
-	for i, str := range args {
-		args[i] = strings.Trim(str, "'")
-	}
-	return args
-}
+var ErrCtrlC = errors.New("Ctrl-C")
 
-func getExecPath(e string) (string, error) {
-	var pathArray = strings.Split(os.Getenv("PATH"), ":")
-	for _, path := range pathArray {
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error reading PATH environment variable: "+path+":\n"+err.Error())
-			continue
-		}
-		for _, entry := range entries {
-			if e == entry.Name() {
-				return path + "/" + entry.Name(), nil
-			}
+func parseInput(input []rune) (string, []string) {
+	args := []string{}
+
+	var inQuote = false
+	var arg strings.Builder
+	for _, r := range input {
+		if r == '\'' {
+			inQuote = !inQuote
+		} else if (r == ' ' && !inQuote) {
+			args = append(args, arg.String())
+			arg.Reset()
+		} else {
+			arg.WriteRune(r)
 		}
 	}
-	return "", errors.New("no path found for " + e)
+	args = append(args, arg.String())
+	return args[0], args[1:]
 }
 
-func interactiveReader() (string, error) {
+func interactiveReader() ([]rune, error) {
 	fd := int(os.Stdin.Fd())
 
 	// Put terminal in raw mode.
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// Ensure we restore the terminal before exit.
-	defer func() {
-		// Restore terminal state
-		term.Restore(fd, oldState)
-	}()
+	defer term.Restore(fd, oldState)
 
 	// Print prompt
-	fmt.Fprint(os.Stdout, "JBShell★ ")
+	fmt.Fprint(os.Stdout, "JBShell * > ")
 
 	reader := bufio.NewReader(os.Stdin)
 	var result []rune
 
 	// Read input character by character.
 	for {
-		char, _, err := reader.ReadRune()
-		if err != nil {
-			return "", err
+		char0, _, err0 := reader.ReadRune()
+		if err0 != nil {
+			return []rune{}, err0
+		}
+
+		// On tab | TODO: implemet tab completion
+		if char0 == '\t' {
+			continue
+		}
+
+		// On any arrow key | TODO: allow arrow key edits
+		if char0 == 27 { // catch escape character
+			char1, _, err1 := reader.ReadRune()
+			if err1 != nil {
+				return []rune{}, err1
+			}
+			if char1 == '[' {
+				char2, _, err2 := reader.ReadRune()
+				if err2 != nil {
+					return []rune{}, err2
+				}
+				if 'A' <= char2 && char2 <= 'D' {
+					continue
+				}
+			}
 		}
 
 		// On Enter (handle both CR and LF)
-		if char == '\r' || char == '\n' || char == 3 {
-			// Print newline (to complete the prompt line)
+		if char0 == '\r' || char0 == '\n' {
 			break
 		}
 
+		// On Crtl-C
+		if char0 == 3 {
+			return nil, ErrCtrlC
+		}
+
 		// Handle backspace: typically '\b' (8) or DEL (127)
-		if char == '\b' || char == 127 {
+		if char0 == '\b' || char0 == 127 {
 			if len(result) > 0 {
 				// Remove last character from the input buffer.
 				result = result[:len(result)-1]
@@ -80,15 +101,16 @@ func interactiveReader() (string, error) {
 			}
 		} else {
 			// Append to our buffer and echo the character.
-			result = append(result, char)
-			fmt.Fprint(os.Stdout, string(char))
+			result = append(result, char0)
+			fmt.Fprint(os.Stdout, string(char0))
 		}
 	}
-	return string(result), nil
+	defer fmt.Fprintln(os.Stdout, "\r")
+	return result, nil
 }
 
 func execute(executable string, args []string) error {
-	path, err := getExecPath(executable)
+	path, err := exec.LookPath(executable)
 	if err != nil {
 		return errors.New(executable + ": command not found")
 	}
@@ -103,39 +125,36 @@ func execute(executable string, args []string) error {
 func _type(args []string) string {
 	if len(args) != 1 {
 		return "usage: type [command]"
+	}
+	if slices.Contains(builtins, args[0]) {
+		return args[0] + " is a shell builtin command"
+	}
+	path, err := exec.LookPath(args[0])
+	if err == nil || errors.Is(err, exec.ErrDot) {
+		return args[0] + " is " + path
 	} else {
-		for _, cmd := range builtins {
-			if args[0] == cmd {
-				return args[0] + " is a shell builtin command"
-			}
-		}
-		path, err := getExecPath(args[0])
-		if err != nil {
-			return args[0] + ": is not recognised"
-		} else {
-			return args[0] + " is " + path
-		}
+		return args[0] + ": is not recognised"
 	}
 }
 
-func _exit(args []string) string {
+func _exit(args []string) {
 	var code int
 	var err error
-	if len(args) > 0 {
+	if len(args) == 1 {
 		code, err = strconv.Atoi(args[0])
 	} else {
 		code = 0
 	}
 	if err != nil {
-		return "invalid argument passed, argument must be an integer"
+		fmt.Fprintln(os.Stderr, "invalid argument passed, argument must be an integer")
+		os.Exit(1)
 	}
 	os.Exit(code)
-	return ""
 }
 
 func _echo(args []string) string {
 	argstr := strings.Join(args, " ")
-	return argstr + " "
+	return argstr
 }
 
 func _pwd(args []string) string {
@@ -144,7 +163,8 @@ func _pwd(args []string) string {
 	}
 	wd, err := os.Getwd()
 	if err != nil {
-		panic("Could not get working directory" + err.Error())
+		fmt.Fprintln(os.Stderr, "Could not get current directory: "+err.Error())
+		return ""
 	}
 	return wd
 }
@@ -152,6 +172,7 @@ func _pwd(args []string) string {
 func _cd(args []string) {
 	if len(args) != 1 {
 		fmt.Println("usage: cd [path]")
+		return
 	}
 	var err error
 	if args[0] == "~" {
@@ -160,18 +181,21 @@ func _cd(args []string) {
 		err = os.Chdir(args[0])
 	}
 	if err != nil {
-		panic("Could not change directory to: " + args[0] + " " + err.Error())
+		fmt.Fprintln(os.Stderr, "Could not change directory to: "+args[0]+" "+err.Error())
 	}
 }
 
 func main() {
 	for {
 		input, err := interactiveReader()
-		var command string = strings.Split(input, " ")[0]
-		args := unquote(strings.Split(input, " ")[1:])
-		switch command {
+		if errors.Is(err, ErrCtrlC) {
+			fmt.Fprintln(os.Stdout)
+			continue
+		}
+		cmd, args := parseInput(input)
+		switch cmd {
 		case "exit":
-			fmt.Fprintln(os.Stderr, _exit(args))
+			_exit(args)
 		case "echo":
 			fmt.Println(_echo(args))
 		case "type":
@@ -180,8 +204,10 @@ func main() {
 			fmt.Println(_pwd(args))
 		case "cd":
 			_cd(args)
+		case "":
+			continue
 		default:
-			err = execute(command, args)
+			err = execute(cmd, args)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
